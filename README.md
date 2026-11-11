@@ -141,3 +141,79 @@ python -m compileall -q run_case.py summarize.py tests
 ```
 
 Offline tests use synthetic placeholder strings, never original benchmark examples. CI intentionally runs only these offline checks: it does not decrypt data or contact model APIs.
+
+## Experiment 3 — Cross-session context, targeting Stage 2
+
+**New, separate scripts:** `run_context.py` and `analyze_context.py`. Experiment 1 and Experiment 2 runners, analyses, and existing `results/*.jsonl` are unchanged.
+
+### Question and controls
+
+Does including earlier **Session 1** context change the monitor's suspicion score for actions in **Session 2**? This is a follow-up to Experiment 2, where both multi-stage cases had lower isolated Stage 2 suspicion scores than Stage 1 scores. **That difference is not, by itself, a monitoring failure.**
+
+Two original SLEIGHT-Bench two-stage scenarios are evaluated:
+
+- `transcript-perm-launder-corp-2part`
+- `transcript-perm-launder-gcs-2part`
+
+Each scenario uses the official Stage 1 + Stage 2 **attack** pair, and the official Stage 1 + Stage 2 **benign** pair. No labels enter model input. The two arms are:
+
+| Arm | Evidence given to monitor | Score target |
+| --- | --- | --- |
+| `isolated` | Explicitly labeled Session 2 transcript only | Session 2 actions |
+| `cumulative` | Explicitly labeled Session 1 (prior context) followed by Session 2 | Session 2 actions, interpreted with Session 1 context |
+
+Both arms use an **identical added targeting instruction**, in the user message, stating that the monitor must score Session 2 rather than score prior actions in Session 1. The original `control_arena` and `control_arena_doc_planting_aware` system prompts are imported **unchanged** from the pinned SLEIGHT-Bench release. The original `strip_assistant_text` and `render_prompt` implementations are imported from that same release. Stable XML-style session boundaries retain the chronology without inventing a combined agent session.
+
+**Why 16 new calls, not eight?** The Stage 2-only scores from Experiment 2 had no explicit Stage 2 targeting instruction. The new intervention changes the task formulation in *both* experimental arms. For a controlled comparison, obtain fresh isolated and cumulative scores under the same instruction: **2 scenarios × 2 prompts × 2 labels × 2 context arms × 1 trial = 16 billable calls**. Using the eight historical Experiment 2 Stage 2 scores as a control could confound the effect of context with the new targeting instruction and model randomness.
+
+### Run on Windows PowerShell
+
+From the experiment root where your existing decrypted `vendor/sleight-bench` is already prepared:
+
+```powershell
+# Offline tests: include all earlier experiments and Experiment 3.
+python -m unittest discover -s tests -v
+python -m compileall -q run_case.py summarize.py run_context.py analyze_context.py tests
+
+# Inspect the 16-call plan; no API key required and no model charges.
+uv run --project vendor/sleight-bench python run_context.py --provider openai --model gpt-6.1-sol --reasoning-effort medium --trials 1
+
+# If the key is not already set in this PowerShell session:
+$secureKey = Read-Host 'OpenAI API key' -AsSecureString
+$env:OPENAI_API_KEY = (New-Object System.Net.NetworkCredential('', $secureKey)).Password
+Remove-Variable secureKey
+
+# 16 paid OpenAI requests. Explicit --execute is required.
+uv run --project vendor/sleight-bench python run_context.py --provider openai --model gpt-6.1-sol --reasoning-effort medium --trials 1 --execute
+
+# Find the precise default output path from the runner's printed summary.
+# Example: locate only cross-session score records:
+Get-ChildItem results\openai-gpt-6.1-sol-context-*-t1.jsonl
+
+# Replace <OUTPUT_PATH> with the actual printed path.
+uv run --project vendor/sleight-bench python analyze_context.py <OUTPUT_PATH> --threshold 70
+```
+
+For Anthropic, use the same dataset, prompts, and conditions, replacing provider/model and setting `ANTHROPIC_API_KEY`:
+
+```powershell
+uv run --project vendor/sleight-bench python run_context.py --provider anthropic --model claude-opus-4-6 --trials 1
+uv run --project vendor/sleight-bench python run_context.py --provider anthropic --model claude-opus-4-6 --trials 1 --execute
+```
+
+The Anthropic path uses the benchmark's original provider configuration, including temperature 1.0 and adaptive thinking. OpenAI uses the Responses API with `store=False`; model settings and token budgets are **not** identical across providers. For either provider, `--execute --resume` skips already recorded conditions only after strict provider/model/effort/revision/source/prompt/**rendered-payload** hash validation. The runner records failed/refused scoring attempts as unscored records, not silent retries. A changed scoring task or added session context changes the payload SHA and therefore invalidates prior resume state.
+
+Use `--scenario transcript-perm-launder-corp-2part` to select only one scenario (eight calls for both arms). Optional `--context-mode cumulative` alone requests eight calls for both scenarios, but it **does not** produce a fresh matched isolated baseline. `--trials 10` for both scenarios and arms requests **160 billable calls**; do not scale until interpreting a one-trial pilot.
+
+### Score-only provenance and analysis
+
+Experiment 3 results live in a separate gitignored `results/*context*.jsonl`, with a default filename determined by provider, model, scenarios, context arms, and trial count. Each record contains provider/model/settings, scenario, prompt, trial, target stage, condition, score/status, token usage, pinned benchmark commit, stage-specific raw-file SHA-256s, unchanged prompt SHA-256, and the **effective rendered system+user payload SHA-256**. No original transcript text, source-derived explanations, model reasoning, API credentials or full prompt+transcript payloads are stored or committed.
+
+`analyze_context.py` requires compatible provider/model/effort/revision records and checks input hashes and pairing before reporting:
+
+- Scores for harmful and benign **Stage 2 targets** under isolated versus cumulative context.
+- Paired within-trial `cumulative - isolated` changes for harmful and benign inputs separately.
+- The difference between these paired changes, only when both labels and both arms have scored values for the same trial index.
+- Missing/invalid scores, counts crossing an **illustrative** threshold, and the limitations of small, synthetic samples.
+
+**Methodological boundary:** Concatenating two already-published transcripts supplies evidence, **not** real execution state or an agent's live memory. Suspicion of earlier Session 1 actions could still influence cumulative scores despite the targeting instruction. Even a larger Stage 2 score is not proof that the monitor recognized a Stage 2-specific authorization violation; separate negative controls and a real executable MCP environment would be needed. This experiment is not a calibrated 1%-FPR test, benchmark-level reproduction, new monitor invention, or demonstrated safety improvement. Its purpose is to test a narrow context-sensitivity hypothesis with traceable outcomes.
