@@ -1,0 +1,9 @@
+/vendor/
+/results/
+/.venv/
+/__pycache__/
+/tests/__pycache__/
+.env
+*.jsonl
+*.enc
+*.bin
