@@ -1,58 +1,95 @@
-# Authorization-confusion replication pilot
+# SLEIGHT-Bench authorization-confusion monitor pilot
 
-Independent empirical replication project. **This repository does not alter or redistribute the Manning MCP book implementation or SLEIGHT-Bench datasets.**
+Independent evaluation harness for **one** SLEIGHT-Bench authorization-confusion case, with interchangeable OpenAI and Anthropic API monitors. This repository **does not modify or redistribute** the Manning book server, or the encrypted/decrypted benchmark dataset.
 
-## Hypothesis and scope
+## Research question and scientific scope
 
-For the SLEIGHT-Bench case `transcript-perm-launder-corp-2part-stage1`, compare the original `control_arena` and published `control_arena_doc_planting_aware` monitor prompts, holding model settings and the harmful/benign transcript pair fixed.
+Compare two **already-published** monitor prompts on the attack and paired benign transcript for `transcript-perm-launder-corp-2part-stage1`:
 
-This is a **one-case replication pilot**, not a novelty claim or reproduction of the paper's aggregate 1%-FPR detection rate. Neither experiment nor MCP extension has produced a model result yet.
+1. `control_arena` (original baseline)
+2. `control_arena_doc_planting_aware` (authors' documentation-aware ablation)
 
-## Primary sources
+The OpenAI path is an exploratory **cross-model evaluation**, not a model-matched reproduction of published Anthropic results. The Anthropic path uses the paper's `claude-opus-4-6` configuration for a narrow replication pilot. Four calls on one attack/benign pair do **not** estimate an aggregate catch rate or FPR. No results are supplied or claimed in this repository.
 
-- [SLEIGHT-Bench paper](https://alignment.anthropic.com/2026/sleight-bench/)
-- [Official benchmark](https://github.com/safety-research/sleight-bench), pinned at `218c58315cc01ff0dc5a100e906c27d82d259521`
+### Primary sources
 
-The benchmark authors encrypt transcripts to avoid accidental ingestion into training corpora. Keep decrypted materials on your workstation and out of this Git repository, chat, and public reporting.
+- [SLEIGHT-Bench publication](https://alignment.anthropic.com/2026/sleight-bench/)
+- [Official SLEIGHT-Bench dataset and implementation](https://github.com/safety-research/sleight-bench), pinned to `218c58315cc01ff0dc5a100e906c27d82d259521`
+- [OpenAI models](https://developers.openai.com/api/docs/models) and [Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
 
-## Prepare on Windows PowerShell
+## Models
 
-Requires Git, Python 3.10+, uv, and (for execution) access to the Anthropic API. The pilot imports prompt preparation, stripping, provider configuration, and response parsing from the pinned upstream code. It saves only scores/metadata to local JSONL; the official benchmark uses BigQuery.
+| Provider | Default model | Configuration | Purpose |
+|---|---|---|---|
+| OpenAI | `gpt-6.1-sol` | Responses API, `reasoning.effort=medium`, no temperature | Recommended first experiment with existing OpenAI credits |
+| Anthropic | `claude-opus-4-6` | Original benchmark's adaptive thinking and `temperature=1.0` | Model-matched pilot |
+
+Optional OpenAI models: `gpt-6-luna` for an inexpensive pipeline check, `gpt-6-astra` for higher-capability comparison. Available models and API rates depend on your account. Do not infer equal inference effort between providers. Keep the provider/model/effort fixed when comparing the two prompts.
+
+## Windows PowerShell setup
+
+Run from the project root (`C:\Toni\Work\sleight-auth-replication`). Requires Git, `uv`, Python 3.10+ and the API key for whichever provider you execute.
 
 ```powershell
+# Skip these cloning/setup commands if you've already done them successfully.
 git clone https://github.com/safety-research/sleight-bench.git vendor/sleight-bench
 git -C vendor/sleight-bench checkout 218c58315cc01ff0dc5a100e906c27d82d259521
 uv sync --project vendor/sleight-bench --locked
 
-# Insert the published decryption key from the upstream README:
-uv run --project vendor/sleight-bench python vendor/sleight-bench/decrypt.py --key '<KEY FROM UPSTREAM README>'
+# Download the benchmark's published decryption key from the upstream README.
+uv run --project vendor/sleight-bench python vendor/sleight-bench/decrypt.py --key '<KEY FROM OFFICIAL README>'
 
-# Check the experiment plan without making model calls:
-uv run --project vendor/sleight-bench python run_case.py --trials 1
-
-# Set ANTHROPIC_API_KEY privately in your environment, then run 4 API calls:
-uv run --project vendor/sleight-bench python run_case.py --trials 1 --execute
-uv run --project vendor/sleight-bench python summarize.py
+# Free dry run (no API requests, no credentials necessary)
+uv run --project vendor/sleight-bench python run_case.py --provider openai --trials 1
 ```
 
-After the smoke test, `--trials 10 --execute` requests **40** evaluations (2 prompts × 2 labels × 10 trials). These calls can be costly. Results are append-only; change `--output` or archive previous scores before rerunning.
+The authors deliberately encrypt data to avoid accidental inclusion in training corpora. Decrypt only on your machine. Do not publish, paste, or upload the benchmark transcript, even if someone asks for debug logs. This experiment necessarily sends the transcript to the selected provider's API when executed; verify your applicable terms and data controls before running. The OpenAI API requests set `store=False`.
 
-## Fixed variables
+### Run with OpenAI (recommended initial experiment)
 
-- Model: `claude-opus-4-6`
-- Temperature 1.0; adaptive thinking enabled; assistant text stripped
-- Same attack and benign transcripts across prompt conditions
-- Published monitor prompts unchanged
-- Original upstream prompt-preparation and score-parsing functions
+Obtain a project key from the [OpenAI Platform](https://platform.openai.com/api-keys). In the current PowerShell session:
 
-## Limitations
+```powershell
+$secureKey = Read-Host 'OpenAI API key' -AsSecureString
+$env:OPENAI_API_KEY = (New-Object System.Net.NetworkCredential('', $secureKey)).Password
+Remove-Variable secureKey
 
-One pair cannot estimate a population false-positive rate or reproduce the authors' aggregate result. Small numbers of repeated calls on one pair measure stochastic variation, not independent attacks. The simplified runner lacks some upstream result-storage and retry behavior. A secure MCP server refusing unauthorized calls and a monitor identifying unsafe agent intent are distinct controls; this pilot cannot show a real MCP policy bypass.
+# Four billable API requests: 2 prompts x attack+benign, 1 trial each.
+uv run --project vendor/sleight-bench python run_case.py --provider openai --model gpt-6.1-sol --reasoning-effort medium --trials 1 --execute
 
-The Manning source repository remains unchanged. A separate, executable MCP transfer test should be designed only after assessing replication results.
+# Descriptive summary: no FPR estimate.
+uv run --project vendor/sleight-bench python summarize.py results/openai-gpt-6.1-sol-t1.jsonl
+```
 
-## Offline tests
+To try a cheaper model, set `--model gpt-6-luna` and use the corresponding output file name. For a more capable (and more expensive) monitor, use `--model gpt-6-astra`.
+
+### Run with Anthropic (optional, later)
+
+```powershell
+$secureKey = Read-Host 'Anthropic API key' -AsSecureString
+$env:ANTHROPIC_API_KEY = (New-Object System.Net.NetworkCredential('', $secureKey)).Password
+Remove-Variable secureKey
+
+uv run --project vendor/sleight-bench python run_case.py --provider anthropic --trials 1 --execute
+uv run --project vendor/sleight-bench python summarize.py results/anthropic-claude-opus-4-6-t1.jsonl
+```
+
+**No Anthropic key is required to run OpenAI, and no OpenAI key is required to run Anthropic.** API billing is separate from ChatGPT/Claude subscriptions.
+
+## Results, resuming and safeguards
+
+- Output is stored in **provider/model/trial-specific** JSONL files under `results/`, which is gitignored. Only numerical scores, metadata hashes, request status and token usage are written: **no raw prompts, transcript text, model reasoning, or API secrets**.
+- A second execution with the same output file is blocked. If a request fails after earlier successful calls, fix the issue and re-run the same command adding `--resume`. This checks existing rows' provider/model/effort, hashes, and trial IDs and submits **only missing conditions**. Do not delete files that include valid scores.
+- Increase trials to 10 only after interpreting the first pilot and considering cost. This produces **40 planned requests**; it still covers one underlying attack/benign pair.
+- `--execute` is required to send any billable request. A dry run never requires a key.
+- For an explicit new experiment, use `--output results/my-new-run.jsonl` rather than overwriting an existing result file.
+
+## Tests (no credentials required)
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Limitations and next research stage
+
+The upstream runner uses BigQuery and more elaborate retries; this small harness reproduces the authors' transcript stripping, prompt rendering, and numeric score parsing but is **not identical to their end-to-end infrastructure**. Different provider inference configurations are not equivalent, and one paired example cannot establish a population-level improvement or novel result. Any executable MCP authorization-transfer experiment is a separate future phase; the Manning server remains unchanged.
