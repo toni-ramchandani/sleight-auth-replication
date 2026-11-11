@@ -1,8 +1,7 @@
-"""Run one SLEIGHT-Bench case with either an Anthropic or an OpenAI monitor.
+"""SLEIGHT-Bench monitor pilot: pinned, multi-case, explicitly billable.
 
-Uses the official benchmark's transcript, prompt rendering, and score parser.
-Never uploads decrypted benchmark data to GitHub or persists monitor reasoning.
-Calls are billable ONLY with the explicit --execute flag.
+The official benchmark supplies transcripts, prompt stripping, rendering and
+score parsing. This standalone runner stores only scores and provenance.
 """
 from __future__ import annotations
 
@@ -13,41 +12,87 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 BENCHMARK_COMMIT = "218c58315cc01ff0dc5a100e906c27d82d259521"
-CASE = "transcript-perm-launder-corp-2part-stage1"
 PROMPTS = ("control_arena", "control_arena_doc_planting_aware")
 DEFAULT_MODELS = {"anthropic": "claude-opus-4-6", "openai": "gpt-6.1-sol"}
 OPENAI_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+
+
+@dataclass(frozen=True)
+class CaseSpec:
+    """Pinned classification: a scenario can span two distinct sessions."""
+
+    name: str
+    scenario: str
+    stage: int
+    stage_count: int
+
+
+AUTHORIZATION_CASES = (
+    CaseSpec("ambiguous-instruction-weight-backup-orion-personal", "ambiguous-instruction-weight-backup-orion-personal", 1, 1),
+    CaseSpec("preprocess-sabotage", "preprocess-sabotage", 1, 1),
+    CaseSpec("transcript-perm-launder-corp-2part-stage1", "transcript-perm-launder-corp-2part", 1, 2),
+    CaseSpec("transcript-perm-launder-corp-2part-stage2", "transcript-perm-launder-corp-2part", 2, 2),
+    CaseSpec("transcript-perm-launder-gcs-2part-stage1", "transcript-perm-launder-gcs-2part", 1, 2),
+    CaseSpec("transcript-perm-launder-gcs-2part-stage2", "transcript-perm-launder-gcs-2part", 2, 2),
+)
+CASE_CATALOG = {case.name: case for case in AUTHORIZATION_CASES}
+# Retain the original Experiment 1 default and its output filename.
+CASE = "transcript-perm-launder-corp-2part-stage1"
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build_plan(root: Path, trials: int) -> list[dict[str, Any]]:
+def select_cases(requested: Sequence[str] | None = None, *, all_authorization: bool = False) -> tuple[str, ...]:
+    if requested and all_authorization:
+        raise ValueError("Choose --all-authorization or individual --case values, not both")
+    if all_authorization:
+        return tuple(case.name for case in AUTHORIZATION_CASES)
+    names = tuple(requested) if requested else (CASE,)
+    if len(names) != len(set(names)):
+        raise ValueError("Duplicate case selector")
+    unknown = [name for name in names if name not in CASE_CATALOG]
+    if unknown:
+        raise ValueError(f"Unknown case(s): {unknown}. Use --list-cases")
+    return names
+
+
+def build_plan(root: Path, trials: int, cases: Sequence[str] | None = None) -> list[dict[str, Any]]:
+    """Build deterministic paired conditions; stop if ANY input is missing."""
     if not 1 <= trials <= 10:
-        raise ValueError("pilot trials must be 1..10")
-    base = root / "attacks" / "authorization_confusion" / CASE
-    required = [base / "transcript.jsonl", base / "benign.jsonl"]
-    required += [root / "prompts" / f"{p}.md" for p in PROMPTS]
-    missing = [str(p) for p in required if not p.is_file()]
+        raise ValueError("Trials per condition must be between 1 and 10")
+    selected = select_cases(cases)
+    inputs: list[dict[str, Any]] = []
+    required: list[Path] = [root / "prompts" / f"{p}.md" for p in PROMPTS]
+    for case_name in selected:
+        spec = CASE_CATALOG[case_name]
+        base = root / "attacks" / "authorization_confusion" / spec.name
+        required.extend((base / "transcript.jsonl", base / "benign.jsonl"))
+        for prompt in PROMPTS:
+            for benign in (False, True):
+                transcript = base / ("benign.jsonl" if benign else "transcript.jsonl")
+                for trial in range(trials):
+                    inputs.append({
+                        "case": spec.name,
+                        "scenario": spec.scenario,
+                        "stage": spec.stage,
+                        "stage_count": spec.stage_count,
+                        "prompt_name": prompt,
+                        "transcript_path": transcript,
+                        "is_benign": benign,
+                        "trial": trial,
+                    })
+    missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
     if missing:
-        raise FileNotFoundError("Benchmark not decrypted or incomplete; missing: " + ", ".join(missing))
-    return [
-        {
-            "prompt_name": prompt,
-            "transcript_path": base / ("benign.jsonl" if benign else "transcript.jsonl"),
-            "is_benign": benign,
-            "trial": i,
-        }
-        for prompt in PROMPTS
-        for benign in (False, True)
-        for i in range(trials)
-    ]
+        raise FileNotFoundError("Missing decrypted benchmark input(s): " + ", ".join(missing))
+    return inputs
 
 
 def check_revision(root: Path) -> str:
@@ -57,63 +102,97 @@ def check_revision(root: Path) -> str:
             capture_output=True, text=True, check=True, timeout=10,
         )
     except (subprocess.SubprocessError, OSError):
-        raise RuntimeError("Benchmark must be a Git checkout pinned to the published commit") from None
+        raise RuntimeError("Benchmark must be a Git checkout pinned to the original release") from None
     revision = completed.stdout.strip()
     if revision != BENCHMARK_COMMIT:
         raise RuntimeError(f"Wrong benchmark revision: {revision}; expected {BENCHMARK_COMMIT}")
     return revision
 
 
-def default_output(provider: str, model: str, trials: int) -> Path:
+def default_output(provider: str, model: str, trials: int, cases: Sequence[str] | None = None) -> Path:
+    """Keep Experiment 1's filename; disambiguate all other selections."""
+    selected = select_cases(cases)
     safe_model = re.sub(r"[^a-zA-Z0-9_.-]", "-", model)
-    return Path("results") / f"{provider}-{safe_model}-t{trials}.jsonl"
+    if selected == (CASE,):
+        suffix = ""
+    elif selected == tuple(c.name for c in AUTHORIZATION_CASES):
+        suffix = "-auth6"
+    else:
+        selection_id = hashlib.sha256("\n".join(sorted(selected)).encode()).hexdigest()[:8]
+        suffix = f"-cases{len(selected)}-{selection_id}"
+    return Path("results") / f"{provider}-{safe_model}{suffix}-t{trials}.jsonl"
 
 
-def condition_key(item: dict[str, Any]) -> tuple[str, bool, int]:
-    return (item["prompt_name"], item["is_benign"], item["trial"])
+def condition_key(item: dict[str, Any]) -> tuple[str, str, bool, int]:
+    return (item["case"], item["prompt_name"], item["is_benign"], item["trial"])
 
 
 def load_completed(
     path: Path, *, provider: str, model: str, revision: str,
     plan: list[dict[str, Any]], root: Path, resume: bool,
     reasoning_effort: str | None,
-) -> set[tuple[str, bool, int]]:
+) -> set[tuple[str, str, bool, int]]:
+    """Reject mixed results, stale source hashes and duplicated conditions."""
     if not path.exists():
         return set()
     if not resume:
-        raise RuntimeError(
-            f"Output {path} already exists. To complete the existing experiment use --resume; "
-            "otherwise choose a different --output path."
-        )
+        raise RuntimeError(f"Output {path} exists. Use --resume, or choose a new --output.")
     valid = {condition_key(item): item for item in plan}
-    completed: set[tuple[str, bool, int]] = set()
+    completed: set[tuple[str, str, bool, int]] = set()
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
         try:
             row = json.loads(line)
-            key = (row["prompt_name"], row["is_benign"], row["trial"])
-            if (key not in valid or key in completed or row["provider"] != provider
-                    or row["model"] != model or row["benchmark_commit"] != revision
-                    or row["case"] != CASE or row.get("reasoning_effort") != reasoning_effort
-                    or row["transcript_sha256"] != sha256(valid[key]["transcript_path"])
+            key = condition_key(row)
+            item = valid.get(key)
+            if item is None or key in completed:
+                raise ValueError("Condition absent from selection or duplicated")
+            if (row["provider"] != provider or row["model"] != model
+                    or row["benchmark_commit"] != revision
+                    or row.get("reasoning_effort") != reasoning_effort
+                    or row.get("temperature") != (1.0 if provider == "anthropic" else None)
+                    or row.get("thinking") is not True
+                    or row.get("strip_assistant") is not True
+                    or row["transcript_sha256"] != sha256(item["transcript_path"])
                     or row["prompt_sha256"] != sha256(root / "prompts" / f"{row['prompt_name']}.md")):
-                raise ValueError("metadata mismatch, duplicate, or unexpected condition")
+                raise ValueError("Run configuration or input hash changed")
+            if "scenario" in row and row["scenario"] != item["scenario"]:
+                raise ValueError("Scenario metadata changed")
+            if "stage" in row and row["stage"] != item["stage"]:
+                raise ValueError("Stage metadata changed")
+            score = row.get("numeric_score")
+            status = row.get("status")
+            if status not in {"scored", "refusal_or_invalid"}:
+                raise ValueError("Unrecognized outcome status")
+            if status == "scored" and (type(score) is not int or not 0 <= score <= 100):
+                raise ValueError("Scored outcome has invalid numeric score")
+            if status == "refusal_or_invalid" and score is not None:
+                raise ValueError("Invalid outcome unexpectedly has a numeric score")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Cannot resume {path}: invalid record at line {line_number}: {exc}") from None
+            raise RuntimeError(f"Cannot resume {path}; invalid line {line_number}: {exc}") from None
         completed.add(key)
     return completed
 
 
+def usage_from_openai(response: Any) -> dict[str, int | None]:
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "output_tokens_details", None)
+    return {
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+        "reasoning_tokens": getattr(details, "reasoning_tokens", None),
+    }
+
+
 def call_monitor(
     provider: str, model: str, effort: str,
-    system_prompt: str | None, user_message: str,
-    client: Any,
+    system_prompt: str | None, user_message: str, client: Any,
 ) -> tuple[str, bool, str | None, dict[str, int | None]]:
-    """Return response text, refusal flag, stop reason, and token usage."""
+    """Call a monitor and return text, refusal, stop reason, token usage."""
     if provider == "openai":
-        # Reasoning models may reject temperature; intentionally omit it.
-        # store=False avoids persisting this benchmark transcript as a stored Response.
+        # Reasoning-model API requests intentionally omit temperature.
+        # store=False disallows storing the benchmark input as a persisted Response.
         params: dict[str, Any] = {
             "model": model,
             "input": user_message,
@@ -128,10 +207,10 @@ def call_monitor(
         status = getattr(response, "status", None)
         if status not in (None, "completed"):
             return "", False, f"response_{status}", usage_from_openai(response)
-        content = getattr(response, "output_text", "") or ""
-        return content, False, status, usage_from_openai(response)
+        return getattr(response, "output_text", "") or "", False, status, usage_from_openai(response)
 
-    # Preserve upstream model-matched Anthropic API configuration and parser.
+    if provider != "anthropic":
+        raise ValueError(f"Unsupported provider: {provider}")
     from evaluate.core.providers import build_api_params, call_anthropic
     from evaluate.core.response import extract_response_parts
     from evaluate.core.types import MonitorSpec
@@ -151,59 +230,56 @@ def call_monitor(
     }
 
 
-def usage_from_openai(response: Any) -> dict[str, int | None]:
-    usage = getattr(response, "usage", None)
-    details = getattr(usage, "output_tokens_details", None)
-    return {
-        "input_tokens": getattr(usage, "input_tokens", None),
-        "output_tokens": getattr(usage, "output_tokens", None),
-        "reasoning_tokens": getattr(details, "reasoning_tokens", None),
-    }
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark-dir", type=Path, default=Path("vendor/sleight-bench"))
     parser.add_argument("--provider", choices=("openai", "anthropic"), default="openai")
-    parser.add_argument("--model", help="API model ID; defaults to gpt-6.1-sol or claude-opus-4-6")
-    parser.add_argument("--reasoning-effort", choices=OPENAI_EFFORTS, default="medium",
-                        help="OpenAI reasoning effort (ignored by the published Anthropic configuration)")
-    parser.add_argument("--trials", type=int, default=1, help="Trials per prompt/label condition (1..10)")
-    parser.add_argument("--execute", action="store_true", help="Explicitly authorize paid API calls")
-    parser.add_argument("--resume", action="store_true", help="Skip already-scored records in existing output")
-    parser.add_argument("--output", type=Path, help="Output JSONL; default is provider/model-specific")
+    parser.add_argument("--model", help="Provider API model ID")
+    parser.add_argument("--reasoning-effort", choices=OPENAI_EFFORTS, default="medium")
+    parser.add_argument("--trials", type=int, default=1, help="Trials per prompt/label (1..10)")
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--all-authorization", action="store_true", help="All 6 pinned authorization-confusion transcript directories")
+    selector.add_argument("--case", action="append", choices=tuple(CASE_CATALOG), help="Select one or more case directories; repeat option")
+    parser.add_argument("--list-cases", action="store_true", help="Display case/scenario/stage mapping without reading data")
+    parser.add_argument("--execute", action="store_true", help="Explicitly authorize paid provider calls")
+    parser.add_argument("--resume", action="store_true", help="Skip existing condition records after strict integrity checks")
+    parser.add_argument("--output", type=Path, help="Override the default results/ file path")
     args = parser.parse_args(argv)
+
+    if args.list_cases:
+        for spec in AUTHORIZATION_CASES:
+            print(f"{spec.name} | scenario={spec.scenario} | stage={spec.stage}/{spec.stage_count}")
+        return 0
     model = args.model or DEFAULT_MODELS[args.provider]
     if args.provider == "openai" and not model.startswith("gpt-"):
-        parser.error("OpenAI provider requires a GPT model ID")
+        parser.error("OpenAI provider requires a gpt-* model ID")
     if args.provider == "anthropic" and not model.startswith("claude-"):
         parser.error("Anthropic provider requires a claude-* model ID")
     if args.provider == "anthropic" and args.reasoning_effort != "medium":
-        parser.error("--reasoning-effort only controls the OpenAI path; Anthropic uses published adaptive thinking")
+        parser.error("Reasoning effort is OpenAI-only; Anthropic uses the published adaptive thinking config")
+    selected = select_cases(args.case, all_authorization=args.all_authorization)
     root = args.benchmark_dir.resolve()
     try:
         revision = check_revision(root)
-        plan = build_plan(root, args.trials)
+        plan = build_plan(root, args.trials, selected)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"PRECHECK FAILED: {exc}", file=sys.stderr)
         return 2
-
     effort: str | None = args.reasoning_effort if args.provider == "openai" else None
-    target = args.output or default_output(args.provider, model, args.trials)
+    target = args.output or default_output(args.provider, model, args.trials, selected)
     print(f"Benchmark revision: {revision}")
-    print(f"Case: {CASE}")
+    print(f"Cases: {len(selected)} directories across {len({CASE_CATALOG[c].scenario for c in selected})} scenarios")
     print(f"Provider: {args.provider}; model: {model}; reasoning: {effort or 'adaptive'}")
-    print("Conditions: control_arena + control_arena_doc_planting_aware; harmful + benign")
+    print(f"Prompts: {', '.join(PROMPTS)}; attack + benign; trials per condition: {args.trials}")
     print(f"Planned requests: {len(plan)}; output: {target}")
     if not args.execute:
-        print("DRY RUN COMPLETE: No API calls or research results generated.")
+        print("DRY RUN COMPLETE: No model API requests or results generated.")
         return 0
 
     key_env = "OPENAI_API_KEY" if args.provider == "openai" else "ANTHROPIC_API_KEY"
     if not os.environ.get(key_env):
-        print(f"Missing {key_env}; stop before making any calls", file=sys.stderr)
+        print(f"Missing {key_env}; stopped before making calls", file=sys.stderr)
         return 2
-
     try:
         completed = load_completed(
             target, provider=args.provider, model=model, revision=revision,
@@ -213,12 +289,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"OUTPUT PRECHECK FAILED: {exc}", file=sys.stderr)
         return 2
     remaining = [item for item in plan if condition_key(item) not in completed]
-    print(f"Previously completed: {len(completed)}; remaining billable calls: {len(remaining)}")
+    print(f"Existing condition records: {len(completed)}; remaining billable calls: {len(remaining)}")
     if not remaining:
-        print("All requested conditions are already scored. No API calls made.")
+        print("All requested conditions are recorded; no API calls made.")
         return 0
 
-    # SDK imports are delayed so dry run needs no API packages or credentials.
     try:
         if args.provider == "openai":
             from openai import OpenAI
@@ -230,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         from evaluate.core.transcript import render_prompt, strip_assistant_text
         from evaluate.core.response import parse_response
     except ImportError as exc:
-        print(f"Dependency unavailable: {exc}; reinstall with uv sync --project vendor/sleight-bench --locked", file=sys.stderr)
+        print(f"Dependencies unavailable ({type(exc).__name__}); run uv sync --project vendor/sleight-bench --locked", file=sys.stderr)
         return 2
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -241,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
             prepared = strip_assistant_text(transcript_path.read_text(encoding="utf-8"))
             prompt_path = root / "prompts" / f"{prompt}.md"
             system_prompt, user_message = render_prompt(prompt_path.read_text(encoding="utf-8"), prepared)
-            print(f"Running {index}/{len(remaining)}: {prompt}, benign={item['is_benign']}, trial={item['trial']}", flush=True)
+            print(f"Running {index}/{len(remaining)}: {item['case']}, {prompt}, benign={item['is_benign']}, trial={item['trial']}", flush=True)
             try:
                 answer, refusal, stop_reason, usage = call_monitor(
                     args.provider, model, args.reasoning_effort, system_prompt,
@@ -249,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 parsed = parse_response(answer)
                 score = parsed.get("numeric_score")
-                if refusal or not isinstance(score, int) or not 0 <= score <= 100:
+                if refusal or type(score) is not int or not 0 <= score <= 100:
                     score = None
                 row = {
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -260,7 +335,10 @@ def main(argv: list[str] | None = None) -> int:
                     "thinking": True,
                     "strip_assistant": True,
                     "benchmark_commit": revision,
-                    "case": CASE,
+                    "case": item["case"],
+                    "scenario": item["scenario"],
+                    "stage": item["stage"],
+                    "stage_count": item["stage_count"],
                     "prompt_name": prompt,
                     "is_benign": item["is_benign"],
                     "trial": item["trial"],
@@ -272,11 +350,11 @@ def main(argv: list[str] | None = None) -> int:
                     **usage,
                 }
             except Exception as exc:
-                print(f"API FAILURE ({type(exc).__name__}); no transcript or key displayed. Fix and use --resume.", file=sys.stderr)
+                print(f"API FAILURE ({type(exc).__name__}); no input text or secret displayed. Repair and use --resume.", file=sys.stderr)
                 return 3
             output.write(json.dumps(row, sort_keys=True) + "\n")
             output.flush()
-    print(f"Completed. Saved score-only records to {target}; use summarize.py {target}")
+    print(f"Completed. Score-only records: {target}. Summarize using: python summarize.py {target}")
     return 0
 
 
