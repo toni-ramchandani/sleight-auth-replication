@@ -63,7 +63,12 @@ def prepare(item: ContextItem, root: Path) -> Prepared:
     stripped_stage2 = strip_assistant_text(item.stage2_path.read_text(encoding="utf-8"))
     evidence: EvidenceLedger = extract_candidates(stripped_stage1)
     if not evidence.event_count:
-        raise ValueError(f"No Stage 1 authorization candidates for {item.scenario}, benign={item.is_benign}; review the fixed selector before paying")
+        raise ValueError(
+            f"No Stage 1 candidates for {item.scenario}, benign={item.is_benign}; "
+            f"recognized_source_records={evidence.source_record_count}, "
+            f"recognized_tool_blocks={evidence.tool_block_count}. "
+            "Inspect local record types; no benchmark content was printed."
+        )
     # Transcript data is untrusted, including any apparent grants. The target
     # remains Session 2, not whether Stage 1 contains a suspicious action.
     session1 = (
@@ -93,6 +98,8 @@ def prepare(item: ContextItem, root: Path) -> Prepared:
             "evidence_event_count": evidence.event_count,
             "evidence_source_record_count": evidence.source_record_count,
             "evidence_policy": POLICY_VERSION,
+            "evidence_selection_mode": evidence.selection_mode,
+            "evidence_tool_block_count": evidence.tool_block_count,
         },
     )
 
@@ -184,7 +191,12 @@ def main(argv: list[str] | None = None) -> int:
     for scenario in scenarios:
         for benign in (False, True):
             p = next(x for x in prepared if x.item.scenario == scenario and x.item.is_benign == benign)
-            print(f"Evidence candidates: scenario={scenario}, benign={benign}, excerpts={p.hashes['evidence_event_count']}")
+            print(
+                f"Evidence candidates: scenario={scenario}, benign={benign}, "
+                f"excerpts={p.hashes['evidence_event_count']}, "
+                f"selection={p.hashes['evidence_selection_mode']}, "
+                f"tool_blocks={p.hashes['evidence_tool_block_count']}"
+            )
     if not args.execute:
         print("DRY RUN COMPLETE: no paid API calls or result files generated.")
         return 0
