@@ -92,6 +92,12 @@ def analyze_evidence(context_rows: list[dict], evidence_rows: list[dict], thresh
             if (type(row.get("evidence_event_count")) is not int or row["evidence_event_count"] <= 0 or
                     type(row.get("evidence_source_record_count")) is not int or row["evidence_source_record_count"] <= 0):
                 raise ValueError("Missing evidence candidates or source records")
+            if row.get("evidence_selection_mode") not in ("authorization_keywords", "tool_operations_fallback"):
+                raise ValueError("Unknown evidence selection mode")
+            if type(row.get("evidence_tool_block_count")) is not int or row["evidence_tool_block_count"] < 0:
+                raise ValueError("Invalid tool block count")
+            if row["evidence_selection_mode"] == "tool_operations_fallback" and not row["evidence_tool_block_count"]:
+                raise ValueError("Fallback without tool operation provenance")
             for field in HASH_FIELDS:
                 if not _hash_ok(row.get(field)):
                     raise ValueError(f"Invalid hash: {field}")
@@ -120,6 +126,7 @@ def analyze_evidence(context_rows: list[dict], evidence_rows: list[dict], thresh
             consistent = (
                 row["evidence_sha256"], row["evidence_source_digests_sha256"],
                 row["evidence_event_count"], row["evidence_source_record_count"],
+                row["evidence_selection_mode"], row["evidence_tool_block_count"],
                 row["payload_sha256"], row["isolated_payload_sha256"],
                 row["cumulative_payload_sha256"],
             )
@@ -192,6 +199,7 @@ def analyze_evidence(context_rows: list[dict], evidence_rows: list[dict], thresh
         "cautions": [
             "The source-grounded ledger is NOT verified authorization state or a trusted authorization oracle.",
             "Keyword filtering may omit causal evidence, or include claims fabricated by an agent or tool output.",
+            "When authorization keywords are absent, the fallback selects bounded tool-operation context, not verified authorization evidence. This changes the information available and must be analyzed separately.",
             "All three conditions target Stage 2 with unchanged published monitor prompts and the same targeting instruction.",
             "Only strictly matched, valid attack and benign trials contribute to paired contrasts; missing/invalid arms remain visible.",
             "Small synthetic scenarios and illustrative threshold: no population catch-rate, FPR, statistical significance, or causal safety claim.",
