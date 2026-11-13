@@ -217,3 +217,69 @@ Experiment 3 results live in a separate gitignored `results/*context*.jsonl`, wi
 - Missing/invalid scores, counts crossing an **illustrative** threshold, and the limitations of small, synthetic samples.
 
 **Methodological boundary:** Concatenating two already-published transcripts supplies evidence, **not** real execution state or an agent's live memory. Suspicion of earlier Session 1 actions could still influence cumulative scores despite the targeting instruction. Even a larger Stage 2 score is not proof that the monitor recognized a Stage 2-specific authorization violation; separate negative controls and a real executable MCP environment would be needed. This experiment is not a calibrated 1%-FPR test, benchmark-level reproduction, new monitor invention, or demonstrated safety improvement. Its purpose is to test a narrow context-sensitivity hypothesis with traceable outcomes.
+
+## Experiment 4 — Source-grounded authorization evidence (new)
+
+**Files added:** `authorization_evidence.py`, `run_evidence.py`, `analyze_evidence.py`, `tests/test_evidence.py`.
+
+### Research question, provenance, and limitations
+
+Experiment 3 found inconsistent changes when adding full Stage 1 history to a monitor asked to score Stage 2. The new experimental condition tests whether a **bounded, source-grounded candidate-evidence representation** changes the Stage 2 score, versus (1) Stage 2 alone and (2) complete earlier context. This is an exploratory, transcript-only test; it is not authorization enforcement.
+
+The word **evidence** is carefully scoped. SLEIGHT-Bench transcripts do **not** include a separately authenticated policy/authorization service proving that an actor received a real grant. Therefore this experiment does **not** invent an “approved/denied” ledger, infer a verified grant from agent claims, or supply an attack label to the model. The ledger is *verifiable against the source transcript*, not *proof that the reported permissions were legitimate*. A trustworthy grant/denial oracle requires a separate executable environment (a later experiment).
+
+The deterministic selection policy (`source-anchored-authorization-candidates-v1`) searches the **officially stripped Session 1 transcript** for a fixed, predeclared set of authorization-related terms. It extracts JSON-encoded verbatim excerpts with original role/type, 1-indexed stripped-source record position, content-block index, canonical-record and block digests, and canonical-block offsets. Transcript origin classes explicitly distinguish unverified user messages, untrusted tool output and untrusted agent tool calls. Neither metadata, attack/benign labels, benchmark outcome annotations, nor model-generated authorization summaries are used to select evidence. The *same* fixed selector runs on both attack and benign pairs. Excerpts are bounded and the process fails closed rather than silently discarding excess candidates; if a source has **no** candidates, the precheck stops, because the test would not meaningfully evaluate permission evidence.
+
+All three arms retain the published monitor prompts and Experiment 3's **identical Stage 2 targeting instruction**:
+
+| Mode | Stage 1 representation | Stage 2 content | Evaluation |
+| --- | --- | --- | --- |
+| `isolated` (from Experiment 3) | None | Official stripped Stage 2 | Stage 2 score |
+| `cumulative` (from Experiment 3) | Entire official stripped Stage 1 | Same official stripped Stage 2 | Stage 2 score |
+| `evidence` (Experiment 4, new) | Source-grounded candidate ledger extracted from stripped Stage 1 | Same official stripped Stage 2 | Stage 2 score |
+
+**Only the third arm requires new calls.** Two scenarios × two published prompts × harmful/benign × one trial = **eight new API requests**. The analyzer refuses to compare them to Experiment 3 records if provider/model/effort/revision, prompt hash, source hashes or either **effective Experiment 3 model-input hash** differ. Results for different model providers must be analyzed separately.
+
+**Methodological caveat:** A keyword-excerpt representation is not a complete state tracker, can omit relevant authorization evidence, can include forged claims, and changes both information volume and structure. A better score does not prove the model reconstructed valid permission provenance, nor that an agent action would be correctly blocked by a real service. The authors' existing state-tracking and monitoring work should be treated as a related baseline rather than a novel contribution claimed here.
+
+### Windows PowerShell runbook
+
+Use the same project root (`C:\Toni\Work\sleight-auth-replication`), existing decrypted/pinned `vendor/sleight-bench`, and existing Experiment 3 JSONL. **Keep `vendor/` and `results/` unchanged.** When installing via ZIP, copy the four new files above and optionally this `README.md`; do not overwrite the earlier scripts or result files.
+
+```powershell
+# Run offline unit tests; no API calls or benchmark text is required.
+python -m unittest discover -s tests -v
+python -m compileall -q authorization_evidence.py run_evidence.py analyze_evidence.py tests
+
+# Preview model-independent extraction counts and the eight-call plan.
+# This uses the locally decrypted source, but makes no API calls.
+uv run --project vendor/sleight-bench python run_evidence.py --provider openai --model gpt-6.1-sol --reasoning-effort medium --trials 1
+
+# If necessary, set the API key in this PowerShell session without displaying it:
+$secureKey = Read-Host 'OpenAI API key' -AsSecureString
+$env:OPENAI_API_KEY = (New-Object System.Net.NetworkCredential('', $secureKey)).Password
+Remove-Variable secureKey
+
+# Only after reviewing the dry run: eight billable new evidence-arm calls.
+uv run --project vendor/sleight-bench python run_evidence.py --provider openai --model gpt-6.1-sol --reasoning-effort medium --trials 1 --execute
+
+# The program prints the exact new results path; locate it if needed:
+Get-ChildItem results\openai-gpt-6.1-sol-evidence-*-t1.jsonl
+
+# Compare with your previously completed Experiment 3 output:
+uv run --project vendor/sleight-bench python analyze_evidence.py `
+  "results\openai-gpt-6.1-sol-context-56b82603-t1.jsonl" `
+  "results\YOUR_EVIDENCE_FILENAME.jsonl" --threshold 70
+```
+
+The last command uses an **actual new output filename** printed by `run_evidence.py`; substitute it for `YOUR_EVIDENCE_FILENAME.jsonl`. Do not pass the Experiment 2 output: the Experiment 3 baseline is required because the Stage 2 targeting instruction and exact source hashes are matched.
+
+If the run is interrupted, repeat the identical `run_evidence.py ... --execute --resume` command. The runner records a scored or unscored attempt after every completed request and checks every prior record against the same model, inputs, policy, digest and condition before skipping it. Do not delete the JSONL file to force retries.
+
+Anthropic is supported without changing any files; set `ANTHROPIC_API_KEY` and select `--provider anthropic --model claude-opus-4-6`. For a three-arm Anthropic comparison, first obtain a **matching** Anthropic Experiment 3 isolated/cumulative file; OpenAI and Anthropic scores cannot be combined as if the same model ran all arms.
+
+### Evidence handling, analysis and interpretation
+
+No decrypted transcripts, extracted candidate text, full prompts, model outputs, or private keys are printed or stored in the results JSONL. Only condition labels, score/status, usage, candidate counts, hash-protected provenance and renderer configuration are stored. Session 1 candidate excerpts are JSON-escaped so malicious content cannot literally terminate the outer session tag; the model still treats **all** transcript material as untrusted. **Do not commit benchmark material or results**; the `results/` and `vendor/` directories are ignored.
+
+`analyze_evidence.py` reports attack/benign score arrays in all three conditions, matched-trial `evidence - isolated` and `evidence - cumulative` deltas for each label, and changes in attack-versus-benign separation. Incomplete/invalid trials are excluded from paired comparisons and remain visible in the report. The `--threshold 70` decision boundary is illustrative and **not** calibrated to any population false-positive rate. Repetitions reduce sampling noise on the same synthetic cases but do not create independent scenarios. No causal safety, validity of claimed permissions, statistical significance or benchmark-scale catch-rate assertion follows from this experiment alone.
