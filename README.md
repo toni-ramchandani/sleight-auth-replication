@@ -285,3 +285,54 @@ Anthropic is supported without changing any files; set `ANTHROPIC_API_KEY` and s
 No decrypted transcripts, extracted candidate text, full prompts, model outputs, or private keys are printed or stored in the results JSONL. Only condition labels, score/status, usage, candidate counts, extraction-policy version and selection mode, tool-block counts, hash-protected provenance and renderer configuration are stored. Session 1 candidate excerpts are JSON-escaped so malicious content cannot literally terminate the outer session tag; the model still treats **all** transcript material as untrusted. **Do not commit benchmark material or results**; the `results/` and `vendor/` directories are ignored.
 
 `analyze_evidence.py` reports attack/benign score arrays in all three conditions, matched-trial `evidence - isolated` and `evidence - cumulative` deltas for each label, and changes in attack-versus-benign separation. Incomplete/invalid trials are excluded from paired comparisons and remain visible in the report. The `--threshold 70` decision boundary is illustrative and **not** calibrated to any population false-positive rate. Repetitions reduce sampling noise on the same synthetic cases but do not create independent scenarios. No causal safety, validity of claimed permissions, statistical significance or benchmark-scale catch-rate assertion follows from this experiment alone.
+
+## Experiment 5 — Stage 1 representation ablations
+
+Experiment 5 tests whether the Stage 2 attack–benign score gap depends on the information selected from Stage 1, the ledger format, or the explanation and metadata accompanying the excerpts. The design uses both two-stage scenarios, both published monitor prompts, and the official harmful and benign transcripts. The Stage 2 payload and targeting instruction follow Experiments 3 and 4. All four arms share the Stage 1 session wrapper. The runner verifies the [pinned schema](https://github.com/safety-research/sleight-bench/blob/218c58315cc01ff0dc5a100e906c27d82d259521/FORMAT.md) revision and the runtime files used from that checkout.
+
+| Arm | Stage 1 representation | Main comparison |
+| --- | --- | --- |
+| `formatted_full` | Every officially stripped record, in order, quoted in the ledger entry format, including the roleless canary retained by the official stripper | Experiment 3 cumulative and fresh evidence |
+| `neutral_context` | Tool protocol event roles, block types and source positions. Source-free markers pad the length to the evidence ledger's offline token proxy. | Fresh evidence, with provider input token deltas reported |
+| `reduced_metadata` | The exact Experiment 4 excerpts with role, block type and source positions. The outer explanation, selection labels and per-entry hashes are omitted from the model input. | Fresh evidence |
+| `evidence` | The original Experiment 4 ledger, checked for identical rendered payload hashes | Experiment 4 historical evidence and the three fresh arms |
+
+Within each trial, the runner shuffles the conditions with a fixed seed. It records the raw and stripped source hashes, prompt and exact rendered payload hashes, representation and source-anchor hashes, request settings, implementation fingerprints, and token usage. Scores, status and metadata go to local JSONL under the ignored `results/` directory by default. Decrypted source, rendered inputs, model text and API credentials stay out of the score ledger. The runner sends evaluation inputs only to the selected provider's official API and supplies no tools.
+
+### Windows PowerShell
+
+Run from the updated project root with the existing pinned checkout in `vendor/sleight-bench`. The one-trial plan is **32 requests per provider**. One `--scenario` reduces the pilot to 16 requests. Two trials on both scenarios require 64 requests. Dry run previews the number of calls, maximum output token exposure and Stage 1 length diagnostics. A dollar estimate depends on provider rates and actual usage.
+
+```powershell
+python -m unittest discover -s tests -q
+python -m compileall -q run_ablation.py representation_ablation.py analyze_ablation.py tests
+
+$run = @('run_ablation.py', '--provider', 'openai', '--model', 'gpt-6.1-sol', '--reasoning-effort', 'medium', '--trials', '1', '--output', 'results/openai-exp5-t1.jsonl')
+uv run --project vendor/sleight-bench --locked python @run
+
+# If the key is missing from this PowerShell session, read it without echoing it.
+if (-not $env:OPENAI_API_KEY) {
+    $secureKey = Read-Host 'OpenAI API key' -AsSecureString
+    $env:OPENAI_API_KEY = (New-Object System.Net.NetworkCredential('', $secureKey)).Password
+    Remove-Variable secureKey
+}
+
+# Explicitly authorize the 32-call run.
+uv run --project vendor/sleight-bench --locked python @run --execute --max-calls 32
+
+# For an interrupted run, first check the provider's usage and preview remaining work.
+uv run --project vendor/sleight-bench --locked python @run --resume
+# Then rerun with --execute --resume --max-calls and your approved remaining ceiling.
+
+python analyze_ablation.py results/openai-exp5-t1.jsonl `
+  --context results/openai-gpt-6.1-sol-context-56b82603-t1.jsonl `
+  --evidence results/openai-gpt-6.1-sol-evidence-09f08b9c-t1.jsonl --threshold 70
+```
+
+For Anthropic, use `--provider anthropic --model claude-opus-4-6`, omit `--reasoning-effort`, use a separate output filename, and set `ANTHROPIC_API_KEY`. The pinned adaptive-thinking configuration has a 128,000-token maximum output per request. The OpenAI setting has an 8,192-token maximum. `--max-calls` is a request ceiling for that invocation. Automatic retries are disabled. An interrupted request can still incur charges if its result was never saved. Resume skips saved scored and unscored attempts and rejects incompatible provenance. Analysis with the Experiment 5 file alone reports the fresh comparisons. Supply both historical files from the same provider, model, and settings to add the historical comparisons.
+
+### Interpreting the contrasts
+
+Compare label-specific changes alongside the change in the paired attack–benign gap. The analyzer retains missing and unscored attempts and shows the provider-reported input token deltas. The neutral arm's offline proxy counts runs of up to four letters or digits and counts punctuation individually. The local dry run matched that proxy across all four transcript variants with 1,088–1,268 repeated padding words. Actual input tokens can differ. Padding and event order can shift attention, and the tool protocol event pattern carries some behavioral information.
+
+The full-history arm changes the amount and placement of content even in the common ledger format. The reduced arm changes both framing and length. All four local transcript variants used Experiment 4's tool-operation fallback. These excerpts reflect the transcript's operational history and any untrusted claims it contains. Historical runs can differ in model behavior across time even when the logged model and inputs match. Two scenarios, repeated prompts and an illustrative threshold of 70 support descriptive comparisons. A larger separation leaves open whether the monitor identified a Stage 2 violation or responded to earlier-session cues.
